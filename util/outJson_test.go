@@ -7,9 +7,6 @@ import (
 	"github.com/alireza0/s-ui/database/model"
 )
 
-// https://github.com/alireza0/s-ui/issues/1243
-// Editing a naive inbound and clearing QUIC Congestion Control must remove
-// the stale quic / quic_congestion_control keys from the stored out_json.
 func TestFillOutJsonNaiveClearsStaleQuic(t *testing.T) {
 	inbound := &model.Inbound{
 		Type:    "naive",
@@ -185,5 +182,127 @@ func TestFillOutJsonSnellClearsStaleVersionOptions(t *testing.T) {
 	}
 	if out["version"] != float64(6) {
 		t.Errorf("version = %v, want 6", out["version"])
+	}
+}
+
+func TestFillOutJsonHysteria2Realm(t *testing.T) {
+	inbound := &model.Inbound{
+		Type: "hysteria2",
+		Tag:  "hy2-in",
+		Options: json.RawMessage(`{"listen_port": 443, "realm": {
+			"server_url": "https://realm.example.com", "token": "server-token", "realm_id": "home",
+			"stun_servers": ["stun.example.com"], "port_mapping": {"enabled": true}}}`),
+		OutJson: json.RawMessage(`{"server_ports": ["2000:3000"], "hop_interval": "30s", "realm": {"token": "client-token", "realm_id": "stale"}}`),
+	}
+
+	if err := FillOutJson(inbound, "example.com"); err != nil {
+		t.Fatal(err)
+	}
+
+	var out map[string]interface{}
+	if err := json.Unmarshal(inbound.OutJson, &out); err != nil {
+		t.Fatal(err)
+	}
+	for _, key := range []string{"server", "server_port", "server_ports", "hop_interval"} {
+		if v, ok := out[key]; ok {
+			t.Errorf("%s conflicts with realm, got %v", key, v)
+		}
+	}
+	realm, _ := out["realm"].(map[string]interface{})
+	if realm["server_url"] != "https://realm.example.com" || realm["realm_id"] != "home" {
+		t.Errorf("realm not taken from the inbound: %v", realm)
+	}
+	if realm["token"] != "client-token" {
+		t.Errorf("token = %v, want the client token kept from out_json", realm["token"])
+	}
+	if _, ok := realm["port_mapping"]; ok {
+		t.Errorf("port_mapping is the server's gateway setting and must not reach clients")
+	}
+
+	// Dropping the realm on the inbound brings the server address back.
+	inbound.Options = json.RawMessage(`{"listen_port": 443}`)
+	if err := FillOutJson(inbound, "example.com"); err != nil {
+		t.Fatal(err)
+	}
+	out = nil
+	if err := json.Unmarshal(inbound.OutJson, &out); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := out["realm"]; ok {
+		t.Errorf("realm survived its removal from the inbound")
+	}
+	if out["server"] != "example.com" {
+		t.Errorf("server = %v, want example.com", out["server"])
+	}
+}
+
+// sing-box refuses to start a naive outbound whose TLS block carries alpn,
+// versions or ciphers, so none of the server profile's values may reach it.
+func TestFillOutJsonNaiveDropsUnsupportedTls(t *testing.T) {
+	inbound := &model.Inbound{
+		Type:    "naive",
+		Tag:     "naive-in",
+		Options: json.RawMessage(`{"listen_port": 443}`),
+		OutJson: json.RawMessage(`{}`),
+		TlsId:   1,
+		Tls: &model.Tls{
+			Id:   1,
+			Name: "tls",
+			Server: json.RawMessage(`{"enabled": true, "server_name": "naive.example.com",
+				"alpn": ["h2", "http/1.1"], "min_version": "1.2", "max_version": "1.3",
+				"cipher_suites": ["TLS_AES_128_GCM_SHA256"]}`),
+			Client: json.RawMessage(`{"insecure": true, "utls": {"enabled": true, "fingerprint": "chrome"}}`),
+		},
+	}
+
+	if err := FillOutJson(inbound, "example.com"); err != nil {
+		t.Fatal(err)
+	}
+
+	var out map[string]interface{}
+	if err := json.Unmarshal(inbound.OutJson, &out); err != nil {
+		t.Fatal(err)
+	}
+	tls, ok := out["tls"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("tls is missing from out_json: %s", inbound.OutJson)
+	}
+	for _, key := range []string{"alpn", "min_version", "max_version", "cipher_suites", "insecure", "utls"} {
+		if v, ok := tls[key]; ok {
+			t.Errorf("%s is not supported on naive outbound, got %v", key, v)
+		}
+	}
+	if tls["enabled"] != true || tls["server_name"] != "naive.example.com" {
+		t.Errorf("enabled and server_name should be kept, got %v", tls)
+	}
+}
+
+// The same server profile on another protocol keeps its alpn.
+func TestFillOutJsonKeepsAlpnForOtherProtocols(t *testing.T) {
+	inbound := &model.Inbound{
+		Type:    "trojan",
+		Tag:     "trojan-in",
+		Options: json.RawMessage(`{"listen_port": 443}`),
+		OutJson: json.RawMessage(`{}`),
+		TlsId:   1,
+		Tls: &model.Tls{
+			Id:     1,
+			Name:   "tls",
+			Server: json.RawMessage(`{"enabled": true, "alpn": ["h2", "http/1.1"]}`),
+			Client: json.RawMessage(`{}`),
+		},
+	}
+
+	if err := FillOutJson(inbound, "example.com"); err != nil {
+		t.Fatal(err)
+	}
+
+	var out map[string]interface{}
+	if err := json.Unmarshal(inbound.OutJson, &out); err != nil {
+		t.Fatal(err)
+	}
+	tls, _ := out["tls"].(map[string]interface{})
+	if _, ok := tls["alpn"]; !ok {
+		t.Errorf("alpn should be kept for trojan, got %v", tls)
 	}
 }

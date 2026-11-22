@@ -142,9 +142,33 @@ func addTls(out *map[string]interface{}, tls *model.Tls) {
 	(*out)["tls"] = tlsConfig
 }
 
+// naiveUnsupportedTls lists the TLS fields sing-box's naive outbound refuses
+// to start with (protocol/naive/outbound.go): it negotiates through cronet,
+// which picks ALPN, versions and ciphers itself. Copying any of them from the
+// server profile made the whole client profile fail to load.
+var naiveUnsupportedTls = []string{
+	"disable_sni", "insecure", "alpn", "min_version", "max_version",
+	"cipher_suites", "curve_preferences",
+	"client_certificate", "client_certificate_path", "client_key", "client_key_path",
+	"fragment", "fragment_fallback_delay", "record_fragment",
+	"kernel_tx", "kernel_rx", "utls", "reality",
+}
+
+// StripNaiveTls removes the TLS fields a naive outbound does not accept.
+func StripNaiveTls(out map[string]interface{}) {
+	tls, ok := out["tls"].(map[string]interface{})
+	if !ok {
+		return
+	}
+	for _, key := range naiveUnsupportedTls {
+		delete(tls, key)
+	}
+}
+
 func naiveOut(out *map[string]interface{}, inbound map[string]interface{}) {
 	delete(*out, "quic")
 	delete(*out, "quic_congestion_control")
+	StripNaiveTls(*out)
 
 	if quic_congestion_control, ok := inbound["quic_congestion_control"].(string); ok && quic_congestion_control != "" {
 		(*out)["quic"] = true
@@ -238,6 +262,34 @@ func hysteria2Out(out *map[string]interface{}, inbound map[string]interface{}) {
 	if obfs, ok := inbound["obfs"]; ok {
 		(*out)["obfs"] = obfs
 	}
+	hysteria2RealmOut(out, inbound)
+}
+
+// hysteria2RealmOut points the client at the realm the inbound registers on.
+// A client reaching the server through a realm must not also name the server
+// address, so those fields go. The token is kept when one was set on the
+// out_json, since the realm can hand clients a token of their own.
+func hysteria2RealmOut(out *map[string]interface{}, inbound map[string]interface{}) {
+	oldRealm, _ := (*out)["realm"].(map[string]interface{})
+	delete(*out, "realm")
+	inRealm, ok := inbound["realm"].(map[string]interface{})
+	if !ok {
+		return
+	}
+	realm := map[string]interface{}{}
+	for _, key := range []string{"server_url", "token", "realm_id", "stun_servers", "ip_version"} {
+		if value, ok := inRealm[key]; ok {
+			realm[key] = value
+		}
+	}
+	if token, _ := oldRealm["token"].(string); token != "" {
+		realm["token"] = token
+	}
+	(*out)["realm"] = realm
+	delete(*out, "server")
+	delete(*out, "server_port")
+	delete(*out, "server_ports")
+	delete(*out, "hop_interval")
 }
 
 func tuicOut(out *map[string]interface{}, inbound map[string]interface{}) {
